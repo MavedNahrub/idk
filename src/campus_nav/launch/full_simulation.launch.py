@@ -37,8 +37,12 @@ from os.path import join
 def generate_launch_description():
     # ── Pre-launch cleanup: terminate any lingering Gazebo processes ───────────
     # Prevents multiple Gazebo GUI windows from opening.
-    subprocess.run(['pkill', '-9', '-f', 'gz sim'], capture_output=True)
-    subprocess.run(['killall', '-9', 'gz-sim-server', 'gz-sim-gui'], capture_output=True)
+    try:
+        subprocess.run(['pkill', '-9', '-f', 'gz sim'], capture_output=True)
+        subprocess.run(['pkill', '-9', 'gz-sim-server'], capture_output=True)
+        subprocess.run(['pkill', '-9', 'gz-sim-gui'], capture_output=True)
+    except FileNotFoundError:
+        pass
 
     # ── Package paths ──────────────────────────────────────────────────────────
     pkg_campus_nav    = get_package_share_directory('campus_nav')
@@ -101,8 +105,8 @@ def generate_launch_description():
         description='Optional: auto-start mission to this stop'
     )
     declare_speed = DeclareLaunchArgument(
-        'nominal_speed', default_value='2.22',
-        description='Nominal cruising speed in m/s (default 2.22 m/s = 8 km/h)'
+        'nominal_speed', default_value='2.40',
+        description='Nominal cruising speed in m/s (default 2.40 m/s = double speed)'
     )
 
     # ── NVIDIA GPU + Gazebo resource path environment ──────────────────────────
@@ -134,6 +138,8 @@ def generate_launch_description():
     )
 
     # ── Spawn saye in Gazebo after 5s world-load delay ─────────────────────────
+    # Spawns directly on the road at SAB C, horizontally aligned with the lane
+    # (SAB C road node: nav=(817.9, 745.1) -> GZ x=26.71, y=-57.41, z=0.60, yaw=-1.61 rad / -92.2°)
     spawn_saye = TimerAction(
         period=5.0,
         actions=[Node(
@@ -145,12 +151,14 @@ def generate_launch_description():
                 '-name',   'saye',
                 '-world',  'campus_world',
                 '-allow_renaming', 'false',
-                '-x', '15.02',
-                '-y', '43.00',
-                '-z', '0.80',
-                '-Y', '3.14159'
+                '-x', '26.70',
+                '-y', '-56.88',
+                '-z', '0.40',
+                '-Y', '1.5708'
             ],
+
             output='screen'
+
         )]
     )
 
@@ -220,22 +228,37 @@ def generate_launch_description():
         executable='odom_bridge_node',
         name='odom_bridge_node',
         output='screen',
+        respawn=True,
+        respawn_delay=1.0,
         parameters=[{'model_name': 'saye', 'use_sim_time': True}]
     )
 
-    # ── [COMMENTED OUT] Pure Pursuit Path Follower ─────────────────────────────
-    # path_follower_node = Node(
-    #     package='campus_nav',
-    #     executable='path_follower_node',
-    #     ...
-    # )
+    # ── Pure Pursuit Path Follower ─────────────────────────────
+    path_follower_node = Node(
+        package='campus_nav',
+        executable='path_follower_node',
+        name='path_follower_node',
+        output='screen',
+        respawn=True,
+        respawn_delay=1.0,
+        parameters=[{
+            'cruise_speed': 2.40,
+            'max_speed': 3.00,
+            'min_speed': 0.80,
+            'corner_lookahead': 2.10,
+            'lookahead': 3.00,
+            'use_sim_time': True
+        }]
+    )
 
-    # ── [COMMENTED OUT] Safety Monitor Node ────────────────────────────────────
-    # safety_monitor_node = Node(
-    #     package='campus_nav',
-    #     executable='safety_monitor_node',
-    #     ...
-    # )
+    # ── Safety Monitor Node ────────────────────────────────────
+    safety_monitor_node = Node(
+        package='campus_nav',
+        executable='safety_monitor_node',
+        name='safety_monitor_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
 
     # ── Nav2 Local Controller & Costmap (Replaces Follower & Safety) ───────────
     nav2_params_file = join(pkg_campus_nav, 'config', 'nav2_params.yaml')
@@ -275,6 +298,8 @@ def generate_launch_description():
         executable='mission_controller_node',
         name='mission_controller_node',
         output='screen',
+        respawn=True,
+        respawn_delay=1.0,
         parameters=[{'osm_file': default_osm, 'use_sim_time': True}]
     )
 
@@ -307,17 +332,39 @@ def generate_launch_description():
         TimerAction(period=2.0, actions=[planner_node]),
         TimerAction(period=2.0, actions=[odom_bridge_node]),
         # TimerAction(period=2.0, actions=[safety_monitor_node]),
-        # TimerAction(period=2.0, actions=[path_follower_node]),
+        TimerAction(period=2.0, actions=[path_follower_node]),
         
+        # Vision-based lane detection (advisory mode — feeds corrections to path follower)
+        TimerAction(period=3.0, actions=[Node(
+            package='saye_control',
+            executable='lane_centering_controller.py',
+            name='lane_centering_controller',
+            output='screen',
+            parameters=[{
+                'camera_topic': '/real_sense/image_raw',
+                'cmd_vel_topic': '/campus/cmd_vel_lane',
+                'driving_mode': 'left_lane',
+                'cruise_speed': 1.5,
+                'enable_control': False
+            }]
+        )]),
+
         # Launch Nav2 Controller and Lifecycle Manager
-        TimerAction(period=2.0, actions=[nav2_adapter_node]),
-        TimerAction(period=2.0, actions=[nav2_controller_node]),
-        TimerAction(period=2.5, actions=[nav2_lifecycle_manager]),
+        # TimerAction(period=2.0, actions=[nav2_adapter_node]),
+        # TimerAction(period=2.0, actions=[nav2_controller_node]),
+        # TimerAction(period=2.5, actions=[nav2_lifecycle_manager]),
 
         TimerAction(period=2.0, actions=[mission_controller_node]),
         TimerAction(period=2.0, actions=[audit_logger_node]),
         TimerAction(period=3.0, actions=[rviz_map_node]),
         TimerAction(period=3.5, actions=[rviz_lidar_node]),
+        TimerAction(period=3.0, actions=[Node(
+            package='campus_nav',
+            executable='dashboard_node',
+            name='dashboard_node',
+            output='screen',
+            parameters=[{'port': 8080}]
+        )]),
         TimerAction(period=4.0, actions=[Node(
             package='campus_nav',
             executable='arrange_windows',

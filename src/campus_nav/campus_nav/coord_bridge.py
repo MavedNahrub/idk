@@ -1,32 +1,50 @@
 """
-Coordinate bridge between campus_nav planner frame and Gazebo world frame.
+Coordinate bridge between campus_nav planner frame (OSM metric) and Gazebo world frame.
 
-Both use the same metric scale (1 unit = 1 meter), but have a constant XY offset.
-The offset was calibrated by matching the Gazebo spawn point (14.926, 40.592) to
-the nearest road node in the campus_nav graph → node 14103608599 at (604.97, 900.70).
+Accurately calibrated via alignment of IIT Ropar map1.obj road mesh (roads_service)
+and OSM road network:
+    gz_x = nav_y - 718.37
+    gz_y = 760.49 - nav_x
 
-Transform:
-    nav_x = gz_x + OFFSET_X
-    nav_y = gz_y + OFFSET_Y
+Inverse:
+    nav_x = 760.49 - gz_y
+    nav_y = gz_x + 718.37
+
+Heading / Yaw relationship:
+    dx_gz = dy_nav
+    dy_gz = -dx_nav
+    yaw_gz = yaw_nav - pi/2
+    yaw_nav = yaw_gz + pi/2
 """
 
 import math
 
-# Constant offset between coordinate frames (meters)
-# Calibrated via ICP alignment between map1.obj road mesh and OSM road graph:
-# Gazebo spawn (14.926, 40.592) maps to SAB C node 11752291183 at (816.9, 720.3)
-OFFSET_X = 802.0
-OFFSET_Y = 679.7
+T_X = 760.49
+T_Y = 718.37
 
 
 def gz_to_nav(gz_x, gz_y):
     """Convert Gazebo world coordinates to campus_nav planner coordinates."""
-    return gz_x + OFFSET_X, gz_y + OFFSET_Y
+    nav_x = T_X - gz_y
+    nav_y = gz_x + T_Y
+    return nav_x, nav_y
 
 
 def nav_to_gz(nav_x, nav_y):
     """Convert campus_nav planner coordinates to Gazebo world coordinates."""
-    return nav_x - OFFSET_X, nav_y - OFFSET_Y
+    gz_x = nav_y - T_Y
+    gz_y = T_X - nav_x
+    return gz_x, gz_y
+
+
+def yaw_nav_to_gz(yaw_nav):
+    """Convert heading from nav (map) frame to Gazebo world frame."""
+    return (yaw_nav - math.pi / 2.0 + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def yaw_gz_to_nav(yaw_gz):
+    """Convert heading from Gazebo world frame to nav (map) frame."""
+    return (yaw_gz + math.pi / 2.0 + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def convert_path_nav_to_gz(path_msg):
@@ -38,6 +56,13 @@ def convert_path_nav_to_gz(path_msg):
         gx, gy = nav_to_gz(pose.pose.position.x, pose.pose.position.y)
         pose.pose.position.x = gx
         pose.pose.position.y = gy
+        yaw_n = yaw_from_quaternion(pose.pose.orientation)
+        yaw_g = yaw_nav_to_gz(yaw_n)
+        qx, qy, qz, qw = quaternion_from_yaw(yaw_g)
+        pose.pose.orientation.x = qx
+        pose.pose.orientation.y = qy
+        pose.pose.orientation.z = qz
+        pose.pose.orientation.w = qw
     return path_msg
 
 
@@ -50,6 +75,13 @@ def convert_path_gz_to_nav(path_msg):
         nx, ny = gz_to_nav(pose.pose.position.x, pose.pose.position.y)
         pose.pose.position.x = nx
         pose.pose.position.y = ny
+        yaw_g = yaw_from_quaternion(pose.pose.orientation)
+        yaw_n = yaw_gz_to_nav(yaw_g)
+        qx, qy, qz, qw = quaternion_from_yaw(yaw_n)
+        pose.pose.orientation.x = qx
+        pose.pose.orientation.y = qy
+        pose.pose.orientation.z = qz
+        pose.pose.orientation.w = qw
     return path_msg
 
 
@@ -63,3 +95,4 @@ def yaw_from_quaternion(q):
 def quaternion_from_yaw(yaw):
     """Return (x, y, z, w) quaternion tuple from a yaw angle."""
     return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+

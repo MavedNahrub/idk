@@ -79,8 +79,12 @@ class CampusMap:
                         self.road_graph[u][v] = dist
                         self.road_graph[v][u] = dist
 
+        # Snap road nodes to 3D road mesh centerlines (IIT Ropar map1.obj)
+        self._snap_to_road_mesh_centerlines()
+
         # Parse building footprints
         for w in root.findall('way'):
+
             if w.get('action') == 'delete':
                 continue
             tags = {t.get('k'): t.get('v') for t in w.findall('tag')}
@@ -131,7 +135,115 @@ class CampusMap:
                     'y': y
                 }
 
+    def _find_map_obj(self):
+        """Find map1.obj mesh file for ground-truth road centerlines."""
+        paths = [
+            os.path.join(os.path.dirname(__file__), '..', '..', '..', 'saye_description', 'worlds', 'map1.obj'),
+            '/home/devamburhan/Documents/CAMP/saye_description/worlds/map1.obj',
+            '/root/colcon_ws/src/ackermann-vehicle-gzsim-ros2/saye_description/worlds/map1.obj',
+            '/root/colcon_ws/install/saye_description/share/saye_description/worlds/map1.obj',
+        ]
+        try:
+            import ament_index_python
+            pkg_share = ament_index_python.get_package_share_directory('saye_description')
+            paths.insert(0, os.path.join(pkg_share, 'worlds', 'map1.obj'))
+        except Exception:
+            pass
+        for p in paths:
+            if os.path.exists(p):
+                return os.path.abspath(p)
+        return None
+
+    def _snap_to_road_mesh_centerlines(self):
+        """
+        Snap OSM road nodes to the ground-truth centerlines extracted from map1.obj.
+        Guarantees that all paths and distance checks are aligned with the physical road mesh.
+        """
+        obj_path = self._find_map_obj()
+        if not obj_path:
+            return
+
+        verts = []
+        try:
+            with open(obj_path, 'r') as f:
+                for line in f:
+                    if line.startswith('v '):
+                        p = list(map(float, line.strip().split()[1:4]))
+                        # map1.obj has roll +pi/2 in SDF: y_world = -z, z_world = y
+                        verts.append((p[0], -p[2], p[1]))
+        except Exception:
+            return
+
+        # Coordinate bridge constants:
+        # gz_x = nav_y - 718.37, gz_y = 760.49 - nav_x
+        # nav_x = 760.49 - gz_y, nav_y = gz_x + 718.37
+        def _gz_to_nav(gx, gy):
+            return 760.49 - gy, gx + 718.37
+
+        mesh_nav_segments = []
+        try:
+            with open(obj_path, 'r') as f:
+                for line in f:
+                    if line.startswith('f '):
+                        parts = line.strip().split()[1:]
+                        if len(parts) == 4:
+                            vi = [int(p.split('/')[0]) - 1 for p in parts]
+                            c0_gx = (verts[vi[0]][0] + verts[vi[3]][0]) / 2.0
+                            c0_gy = (verts[vi[0]][1] + verts[vi[3]][1]) / 2.0
+                            c1_gx = (verts[vi[1]][0] + verts[vi[2]][0]) / 2.0
+                            c1_gy = (verts[vi[1]][1] + verts[vi[2]][1]) / 2.0
+                            mesh_nav_segments.append((_gz_to_nav(c0_gx, c0_gy), _gz_to_nav(c1_gx, c1_gy)))
+        except Exception:
+            return
+
+        if not mesh_nav_segments:
+            return
+
+        def _p_seg_proj(p, a, b):
+            ab = (b[0] - a[0], b[1] - a[1])
+            ab_sq = ab[0] ** 2 + ab[1] ** 2
+            if ab_sq < 1e-6:
+                return math.hypot(p[0] - a[0], p[1] - a[1]), a
+            t = max(0.0, min(1.0, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / ab_sq))
+            proj = (a[0] + t * ab[0], a[1] + t * ab[1])
+            return math.hypot(p[0] - proj[0], p[1] - proj[1]), proj
+
+        # Snap all highway nodes to nearest mesh centerline if within 4.5m
+        for nid in list(self.xy_nodes.keys()):
+            nx, ny = self.xy_nodes[nid]
+            best_d = float('inf')
+            best_proj = None
+            for c0, c1 in mesh_nav_segments:
+                d, proj = _p_seg_proj((nx, ny), c0, c1)
+                if d < best_d:
+                    best_d = d
+                    best_proj = proj
+            if best_d < 4.5:
+                self.xy_nodes[nid] = (round(best_proj[0], 2), round(best_proj[1], 2))
+
+        # Enforce exact centerline intersection for key T-junctions
+        # Node 11752291183 (SAB C junction): gz=(1.17, -56.88)
+        if '11752291183' in self.xy_nodes:
+            self.xy_nodes['11752291183'] = (round(_gz_to_nav(1.17, -56.88)[0], 2),
+                                            round(_gz_to_nav(1.17, -56.88)[1], 2))
+        # Node 9513402263: gz=(308.94, 58.95)
+        if '9513402263' in self.xy_nodes:
+            self.xy_nodes['9513402263'] = (round(_gz_to_nav(308.94, 58.95)[0], 2),
+                                           round(_gz_to_nav(308.94, 58.95)[1], 2))
+
+        # Sync lat/lon in self.nodes with updated xy_nodes
+        for nid, (x, y) in self.xy_nodes.items():
+            self.nodes[nid] = self.to_latlon(x, y)
+
+        # Update Euclidean weights in self.road_graph
+        for u in self.road_graph:
+            for v in self.road_graph[u]:
+                p1 = self.xy_nodes[u]
+                p2 = self.xy_nodes[v]
+                self.road_graph[u][v] = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
     def _load_or_build_stops(self):
+
         # 1. Extract all named stops and amenities directly from the OSM XML
         if os.path.exists(self.osm_path):
             try:
@@ -307,6 +419,28 @@ class CampusMap:
         dist = math.hypot(self.xy_nodes[best_nid][0] - x, self.xy_nodes[best_nid][1] - y)
         return best_nid, dist
 
+    def distance_to_road_segment(self, x, y):
+        """Compute the minimum Euclidean distance from (x, y) to the nearest road segment."""
+        if not self.road_ways:
+            _, d = self.snap_to_road(x, y)
+            return d
+        best_d = float('inf')
+        for way in self.road_ways:
+            for i in range(len(way) - 1):
+                u, v = way[i], way[i + 1]
+                if u in self.xy_nodes and v in self.xy_nodes:
+                    x1, y1 = self.xy_nodes[u]
+                    x2, y2 = self.xy_nodes[v]
+                    dx, dy = x2 - x1, y2 - y1
+                    L2 = dx * dx + dy * dy
+                    if L2 < 1e-4:
+                        continue
+                    t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / L2))
+                    d = math.hypot(x - (x1 + t * dx), y - (y1 + t * dy))
+                    if d < best_d:
+                        best_d = d
+        return best_d
+
     def snap_to_road_directed(self, x, y, yaw):
         """
         Finds closest road segment to (x, y) and determines forward departure node
@@ -356,8 +490,21 @@ class CampusMap:
         return forward_nid, rear_nid, is_dead_end, best_dist
 
     def get_stop_road_node(self, stop_name):
-        """Retrieve the road node ID for a named campus stop."""
+        """Retrieve the road node ID for a named campus stop (supports exact & fuzzy matching)."""
+        s_norm = stop_name.lower().replace('aa', 'a').replace('_', ' ').strip()
+        # 1. Exact match
         for key in self.stops:
-            if key.lower() == stop_name.lower().strip():
+            if key.lower().strip() == stop_name.lower().strip():
+                return self.stops[key]['snapped_road_node_id']
+        # 2. Normalized match (e.g. 'raavi' matches 'ravi')
+        for key in self.stops:
+            k_norm = key.lower().replace('aa', 'a').replace('_', ' ').strip()
+            if s_norm == k_norm:
+                return self.stops[key]['snapped_road_node_id']
+        # 3. Substring match (e.g. 'raavi' matches 'Ravi Back', 'chemistry' matches 'Chemistry Block')
+        for key in self.stops:
+            k_norm = key.lower().replace('aa', 'a').replace('_', ' ').strip()
+            if s_norm in k_norm or k_norm in s_norm:
                 return self.stops[key]['snapped_road_node_id']
         return None
+

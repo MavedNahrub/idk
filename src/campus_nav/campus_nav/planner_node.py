@@ -62,8 +62,8 @@ class CampusPlannerNode(Node):
         self.declare_parameter('osm_file', default_osm)
         self.declare_parameter('stops_file', default_yaml)
         self.declare_parameter('frame_id', 'map')
-        self.declare_parameter('nominal_speed', 2.22, dyn_desc)
-        self.declare_parameter('min_turning_radius', 2.5, dyn_desc)
+        self.declare_parameter('nominal_speed', 2.40, dyn_desc)
+        self.declare_parameter('min_turning_radius', 4.2, dyn_desc)
         self.declare_parameter('default_start_stop', 'SAB C')
         self.declare_parameter('default_goal_stop', 'Chemistry Block')
 
@@ -82,6 +82,7 @@ class CampusPlannerNode(Node):
 
         # Publishers
         self.path_pub = self.create_publisher(Path, '/campus/global_path', 10)
+        self.target_path_pub = self.create_publisher(Path, '/campus/target_path', 10)
         self.nav2_plan_pub = self.create_publisher(Path, '/plan', 10)
         self.speed_pub = self.create_publisher(Float32MultiArray, '/campus/speed_profile', 10)
         self.status_pub = self.create_publisher(String, '/campus/nav_status', 10)
@@ -198,6 +199,23 @@ class CampusPlannerNode(Node):
             status_msg = String()
             status_msg.data = status
             self.status_pub.publish(status_msg)
+
+        # Fix 3: Also drain _pending_route here in case vehicle_pose_callback
+        # never fires (e.g. odom_bridge slow to start, /campus/vehicle_pose not
+        # yet bridged). We synthesise a minimal latest_pose so plan_named_route
+        # can snap the start position correctly.
+        if getattr(self, '_pending_route', None):
+            px = msg.pose.pose.position.x
+            py = msg.pose.pose.position.y
+            from campus_nav.coord_bridge import gz_to_nav, yaw_from_quaternion as _yaw
+            nav_x, nav_y = gz_to_nav(px, py)
+            yaw = _yaw(msg.pose.pose.orientation)
+            self.latest_pose = (nav_x, nav_y, yaw)
+            start_name, goal_name = self._pending_route
+            self._pending_route = None
+            self.get_logger().info(
+                f"📍 [odom_callback] Draining queued route: '{start_name}' -> '{goal_name}'")
+            self.plan_named_route(start_name, goal_name)
 
     def start_stop_callback(self, msg):
         stop_name = msg.data.strip()
@@ -376,6 +394,12 @@ class CampusPlannerNode(Node):
         self.nav2_plan_pub.publish(path_msg)
         self.speed_pub.publish(speed_array)
         self.current_path = path_msg
+
+        # Fix 1: Removed duplicate direct publish to /campus/target_path.
+        # mission_controller_node is the SOLE publisher of Gazebo-frame paths
+        # to /campus/target_path. Publishing here AND there caused the path
+        # follower to receive two messages back-to-back, resetting active_idx
+        # to 0 mid-route and causing the buggy to drive back to its start.
 
         # 1. Active Route Road Carpet: 3.8m wide flat planar ribbon (luminous electric green)
         # Using TRIANGLE_LIST with per-vertex colors forces Ogre to disable lighting,
@@ -647,9 +671,14 @@ class CampusPlannerNode(Node):
             del_marker.action = Marker.DELETEALL
             self.centerline_pub.publish(del_marker)
 
+        # Fix 5: Do NOT republish current_path to /campus/global_path every
+        # 0.5 s. Doing so caused mission_controller's planned_path_callback to
+        # fire on every marker tick, re-converting and re-publishing to
+        # /campus/target_path which reset the path follower's active_idx
+        # mid-route. The path is published once per route plan; the follower
+        # retains it. We still keep /plan (nav2_plan_pub) refresh for RViz.
         if self.current_path is not None:
             self.current_path.header.stamp = now
-            self.path_pub.publish(self.current_path)
             self.nav2_plan_pub.publish(self.current_path)
 
 

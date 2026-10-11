@@ -25,10 +25,46 @@ import subprocess
 import math
 import re
 from campus_nav.osm_loader import CampusMap
-from campus_nav.coord_bridge import nav_to_gz, gz_to_nav
+from campus_nav.coord_bridge import nav_to_gz, gz_to_nav, yaw_nav_to_gz, yaw_gz_to_nav
+import shutil
 
 
 ROAD_SURFACE_Z = 0.60  # Road surface is at Z=0.30m + wheel radius 0.28m
+
+def _get_gz_bin_and_env():
+    gz_bin = shutil.which('gz') or '/opt/ros/jazzy/opt/gz_tools_vendor/bin/gz'
+    env = dict(os.environ)
+    ld_paths = [
+        '/opt/ros/jazzy/opt/sdformat_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_sim_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_gui_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_transport_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_rendering_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_plugin_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_fuel_tools_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_msgs_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_common_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_math_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_utils_vendor/lib',
+        '/opt/ros/jazzy/opt/gz_tools_vendor/lib',
+        '/opt/ros/jazzy/lib'
+    ]
+    cur_ld = env.get('LD_LIBRARY_PATH', '')
+    env['LD_LIBRARY_PATH'] = ':'.join(ld_paths) + ((':' + cur_ld) if cur_ld else '')
+    if 'GZ_CONFIG_PATH' not in env:
+        env['GZ_CONFIG_PATH'] = (
+            '/opt/ros/jazzy/opt/gz_sim_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/sdformat_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_gui_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_transport_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_rendering_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_plugin_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_fuel_tools_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_msgs_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_common_vendor/share/gz:'
+            '/opt/ros/jazzy/opt/gz_tools_vendor/share/gz'
+        )
+    return gz_bin, env
 
 def _find_default_osm():
     candidates = []
@@ -56,7 +92,8 @@ DEFAULT_OSM = _find_default_osm()
 
 def get_current_gz_pose(model='saye'):
     """Query current model position and yaw directly from Gazebo Harmonic."""
-    res = subprocess.run(['gz', 'model', '-m', model, '-p'], capture_output=True, text=True)
+    gz_bin, env = _get_gz_bin_and_env()
+    res = subprocess.run([gz_bin, 'model', '-m', model, '-p'], capture_output=True, text=True, env=env)
     m = re.search(r'\[\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*\]\s*\n\s*\[\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*\]', res.stdout)
     if m:
         x, y, z = float(m.group(1)), float(m.group(2)), float(m.group(3))
@@ -65,11 +102,14 @@ def get_current_gz_pose(model='saye'):
     return None
 
 
-def find_parallel_road_yaw(gz_x, gz_y, current_yaw=3.14159, osm_path=DEFAULT_OSM):
+def find_parallel_road_yaw(gz_x, gz_y, current_yaw=3.14159, target_nav_point=None, osm_path=DEFAULT_OSM):
     """
     Find the tangent heading of the nearest road segment to (gz_x, gz_y),
-    and return the Gazebo yaw that aligns the buggy parallel to that road.
-    Selects the direction closest to current_yaw so the vehicle doesn't reverse unexpectedly.
+    and return the Gazebo MODEL yaw that aligns the buggy parallel to that road.
+
+    CRITICAL: Saye's front faces -Y in base_link frame.
+    physical_heading = model_yaw - π/2
+    Therefore: model_yaw = physical_heading + π/2
     """
     c = CampusMap(osm_path)
     nav_x, nav_y = gz_to_nav(gz_x, gz_y)
@@ -93,7 +133,6 @@ def find_parallel_road_yaw(gz_x, gz_y, current_yaw=3.14159, osm_path=DEFAULT_OSM
                 candidate_segments.append((d, (x1, y1), (x2, y2)))
 
     if not candidate_segments:
-        # Fallback to closest of all segments if far from road
         for way in c.road_ways:
             for i in range(len(way) - 1):
                 u, v = way[i], way[i + 1]
@@ -114,24 +153,48 @@ def find_parallel_road_yaw(gz_x, gz_y, current_yaw=3.14159, osm_path=DEFAULT_OSM
     def angle_diff(a, b):
         return abs((a - b + math.pi) % (2.0 * math.pi) - math.pi)
 
+    def _physical_to_model_yaw(phys_yaw):
+        """Saye front is -Y → model_yaw = physical_heading + π/2."""
+        return (phys_yaw + math.pi / 2.0 + math.pi) % (2.0 * math.pi) - math.pi
+
     best_diff = float('inf')
-    best_yaw = current_yaw
+    best_model_yaw = current_yaw
     best_road_deg = 0.0
 
-    # Consider the nearest road segments
+    # If a destination target is given, route on the road network to find the exact first-edge departure heading
+    if target_nav_point is not None:
+        try:
+            from campus_nav.astar import astar_search
+            s_node, _ = c.snap_to_road(nav_x, nav_y)
+            g_node, _ = c.snap_to_road(target_nav_point[0], target_nav_point[1])
+            route, _ = astar_search(c.road_graph, c.xy_nodes, s_node, g_node)
+            if route and len(route) >= 2:
+                p0 = c.xy_nodes[route[0]]
+                p1 = c.xy_nodes[route[1]]
+                dep_nav = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+                phys_gz = yaw_nav_to_gz(dep_nav)
+                model_yaw = _physical_to_model_yaw(phys_gz)
+                return model_yaw, math.degrees(dep_nav), 0.0
+        except Exception:
+            pass
+
     for d, (x1, y1), (x2, y2) in candidate_segments[:4]:
-        road_angle = math.atan2(y2 - y1, x2 - x1)
-        for direction in (road_angle, road_angle + math.pi):
-            # Because front is along -Y of base_link:
-            # yaw_gz = direction + pi/2
-            cand_yaw = (direction + math.pi / 2.0 + math.pi) % (2.0 * math.pi) - math.pi
-            diff = angle_diff(cand_yaw, current_yaw)
+        road_angle_nav = math.atan2(y2 - y1, x2 - x1)
+        for direction_nav in (road_angle_nav, road_angle_nav + math.pi):
+            phys_gz = yaw_nav_to_gz(direction_nav)
+            model_yaw = _physical_to_model_yaw(phys_gz)
+            if target_nav_point is not None:
+                to_target = math.atan2(target_nav_point[1] - nav_y, target_nav_point[0] - nav_x)
+                diff = angle_diff(direction_nav, to_target)
+            else:
+                diff = angle_diff(model_yaw, current_yaw)
+
             if diff < best_diff:
                 best_diff = diff
-                best_yaw = cand_yaw
-                best_road_deg = math.degrees(direction)
+                best_model_yaw = model_yaw
+                best_road_deg = math.degrees(direction_nav)
 
-    return best_yaw, best_road_deg, candidate_segments[0][0]
+    return best_model_yaw, best_road_deg, candidate_segments[0][0]
 
 
 def teleport_gz(gz_x, gz_y, gz_z=ROAD_SURFACE_Z, yaw=3.14159, world='campus_world', model='saye'):
@@ -150,20 +213,38 @@ def teleport_gz(gz_x, gz_y, gz_z=ROAD_SURFACE_Z, yaw=3.14159, world='campus_worl
         f'position: {{x: {gz_x:.3f}, y: {gz_y:.3f}, z: {gz_z:.3f}}}, '
         f'orientation: {{x: 0.0, y: 0.0, z: {sin_h:.6f}, w: {cos_h:.6f}}}'
     )
+    gz_bin, env = _get_gz_bin_and_env()
     cmd = [
-        'gz', 'service',
+        gz_bin, 'service',
         '-s', f'/world/{world}/set_pose',
         '--reqtype', 'gz.msgs.Pose',
         '--reptype', 'gz.msgs.Boolean',
-        '--timeout', '3000',
+        '--timeout', '10000',
         '--req', req
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if res.returncode == 0 and 'data: true' in res.stdout:
         print(f"✅ Successfully positioned {model} in Gazebo ({gz_x:.2f}, {gz_y:.2f}, Z={gz_z:.2f}, Yaw={math.degrees(yaw):.1f}°)")
         return True
     else:
-        print(f"⚠️ Teleport result: {res.stdout.strip() or res.stderr.strip()}")
+        # Fallback: model might not be spawned yet, attempt to spawn it
+        print(f"⚠️ Teleport returned '{res.stdout.strip() or res.stderr.strip()}'. Attempting to spawn {model}...")
+        spawn_cmd = [
+            'ros2', 'run', 'ros_gz_sim', 'create',
+            '-topic', 'robot_description',
+            '-name', model,
+            '-world', world,
+            '-allow_renaming', 'false',
+            '-x', str(gz_x),
+            '-y', str(gz_y),
+            '-z', str(gz_z),
+            '-Y', str(yaw)
+        ]
+        sres = subprocess.run(spawn_cmd, capture_output=True, text=True, env=env)
+        if 'successful' in (sres.stdout + sres.stderr).lower():
+            print(f"✅ Spawned {model} in Gazebo ({gz_x:.2f}, {gz_y:.2f}, Z={gz_z:.2f}, Yaw={math.degrees(yaw):.1f}°)")
+            return True
+        print(f"❌ Failed to spawn/teleport: {sres.stdout.strip() or sres.stderr.strip()}")
         return False
 
 

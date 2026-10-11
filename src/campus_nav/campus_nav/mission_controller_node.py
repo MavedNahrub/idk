@@ -77,7 +77,11 @@ class MissionControllerNode(Node):
         self.mission_start_time: float = None
         self.mission_state: str = 'IDLE'  # 'IDLE', 'LEG_1_DISPATCH', 'BOARDING', 'LEG_2_DISPATCH'
         self.current_pose_nav = None
-        self._pose_last_updated: float = 0.0   # wall-clock time of last pose update
+        # Fix 2: Use rclpy sim-time (nanoseconds) instead of wall-clock time so
+        # pose freshness is evaluated in simulation time, not real time.
+        # This prevents the mission from being silently dropped when the
+        # simulator runs slower than real-time.
+        self._pose_last_updated_ns: int = 0    # sim-time nanoseconds of last pose update
         self._pending_mission: tuple = None      # (start_name, goal_name) queued until fresh pose
         self._boarding_timer = None
 
@@ -122,7 +126,8 @@ class MissionControllerNode(Node):
     def vehicle_pose_callback(self, msg: PoseStamped):
         """Track buggy's live position in planner coords."""
         self.current_pose_nav = (msg.pose.position.x, msg.pose.position.y)
-        self._pose_last_updated = time.time()
+        # Fix 2: Record pose time in sim-time nanoseconds
+        self._pose_last_updated_ns = self.get_clock().now().nanoseconds
 
         # If a mission was queued waiting for fresh pose, execute it now
         if self._pending_mission:
@@ -161,14 +166,17 @@ class MissionControllerNode(Node):
             return
 
         # ── Pose freshness check ───────────────────────────────────────────────
-        # Reject stale poses (older than 1.5s) — e.g. after teleporting, old SAB C
-        # pose may still be in current_pose_nav while the buggy is now at LOC.
-        pose_age = time.time() - self._pose_last_updated
-        pose_is_fresh = (self.current_pose_nav is not None) and (pose_age < 1.5)
+        # Fix 2: Use sim-time clock instead of wall-clock time so the freshness
+        # window is evaluated in simulation time (important with use_sim_time=True).
+        # Reject stale poses (older than 3.0s sim-time) — e.g. after teleporting,
+        # the old pose may still be cached while the buggy is now at a new location.
+        now_ns = self.get_clock().now().nanoseconds
+        pose_age_s = (now_ns - self._pose_last_updated_ns) / 1e9
+        pose_is_fresh = (self.current_pose_nav is not None) and (pose_age_s < 3.0)
 
         if not pose_is_fresh:
             self.get_logger().warn(
-                f"⏳ Pose not fresh (age={pose_age:.1f}s). Queuing mission until fresh pose arrives...")
+                f"⏳ Pose not fresh (age={pose_age_s:.1f}s sim-time). Queuing mission until fresh pose arrives...")
             self._pending_mission = (start_name, goal_name)
             return
 
@@ -181,7 +189,8 @@ class MissionControllerNode(Node):
         self.current_start_stop = start_name
         self.current_goal_stop  = goal_name
         self.mission_active = True
-        self.mission_start_time = time.time()
+        # Fix 2: Record mission start in sim-time nanoseconds for elapsed time tracking
+        self.mission_start_time = self.get_clock().now().nanoseconds / 1e9
 
         start_nav_x = self.campus.xy_nodes[start_nid][0]
         start_nav_y = self.campus.xy_nodes[start_nid][1]
@@ -197,20 +206,34 @@ class MissionControllerNode(Node):
             f"'{start_name}' at nav ({start_nav_x:.1f}, {start_nav_y:.1f}), "
             f"dist={dist_to_start:.1f}m")
 
-        if dist_to_start > 25.0:
-            # Buggy is elsewhere (e.g. at LOC): Leg 1 (drive from live buggy position to pick-up stop)
-            self.mission_state = 'LEG_1_DISPATCH'
-            self._publish_status(
-                f"Leg 1: Driving from current location to Pick-up point '{start_name}' ({dist_to_start:.0f}m away)...")
-            self.waiting_for_path = True
-            self.plan_route_pub.publish(String(data=f"CURRENT|{start_name}"))
-        else:
-            # Buggy is already at start stop: Leg 2 directly
-            self.mission_state = 'LEG_2_DISPATCH'
-            self._publish_status(
-                f"At start '{start_name}'. Planning route to '{goal_name}'...")
-            self.waiting_for_path = True
-            self.plan_route_pub.publish(String(data=f"CURRENT|{goal_name}"))
+        gz_x, gz_y = nav_to_gz(start_nav_x, start_nav_y)
+        try:
+            from campus_nav.teleport_buggy import find_parallel_road_yaw, teleport_gz
+            goal_nid = self.campus.get_stop_road_node(goal_name)
+            goal_nav = self.campus.xy_nodes.get(goal_nid) if goal_nid else None
+            yaw, _, _ = find_parallel_road_yaw(gz_x, gz_y, target_nav_point=goal_nav)
+            
+            if dist_to_start > 5.0:
+                self.get_logger().info(f"Teleporting buggy to start stop '{start_name}' at Gazebo ({gz_x:.1f}, {gz_y:.1f}, yaw={math.degrees(yaw):.1f}°)")
+                teleport_gz(gz_x, gz_y, yaw=yaw)
+                self.current_pose_nav = (start_nav_x, start_nav_y)
+                # Wait for simulator odometry to confirm vehicle at start stop
+                t_wait = time.time()
+                while time.time() - t_wait < 2.0:
+                    if self.current_pose_nav and math.hypot(self.current_pose_nav[0] - start_nav_x, self.current_pose_nav[1] - start_nav_y) < 5.0:
+                        break
+                    time.sleep(0.1)
+            else:
+                self.get_logger().info(f"Buggy at '{start_name}'. Ensuring departure orientation (yaw={math.degrees(yaw):.1f}°)")
+                teleport_gz(gz_x, gz_y, yaw=yaw)
+        except Exception as e:
+            self.get_logger().warn(f"Teleport helper failed: {e}")
+
+        self.mission_state = 'LEG_2_DISPATCH'
+        self._publish_status(
+            f"Starting at '{start_name}'. Route planning to '{goal_name}'...")
+        self.waiting_for_path = True
+        self.plan_route_pub.publish(String(data=f"{start_name}|{goal_name}"))
 
     # ── Path Reception ─────────────────────────────────────────────────────────
 
@@ -223,9 +246,6 @@ class MissionControllerNode(Node):
         Receive planned path (in PLANNER/campus_nav coords) from planner_node.
         Convert to GAZEBO coords and publish to /campus/target_path for the follower.
         """
-        if not self.waiting_for_path:
-            return
-            
         if not msg.poses:
             self.get_logger().info("Empty path received. Assuming we are already at the destination.")
             self.waiting_for_path = False
@@ -250,7 +270,7 @@ class MissionControllerNode(Node):
             gz_x, gz_y = nav_to_gz(nav_x, nav_y)
 
             # Embed pre-computed speed into z channel (read by path follower)
-            spd = self.speeds[i] if i < len(self.speeds) else 2.22
+            spd = self.speeds[i] if i < len(self.speeds) else 2.40
 
             ps = PoseStamped()
             ps.header = gz_path.header
@@ -286,7 +306,7 @@ class MissionControllerNode(Node):
 
             elif self.mission_state == 'LEG_2_DISPATCH':
                 # Leg 2 Complete: Arrived at final destination
-                elapsed = time.time() - self.mission_start_time if self.mission_start_time else 0
+                elapsed = (self.get_clock().now().nanoseconds / 1e9 - self.mission_start_time) if self.mission_start_time else 0
                 m, s = divmod(int(elapsed), 60)
                 self._publish_status(
                     f"Mission Complete ✅ | '{self.current_start_stop}' → "
@@ -296,12 +316,18 @@ class MissionControllerNode(Node):
                 self.mission_state = 'IDLE'
                 self.clear_pub.publish(String(data='clear'))
         elif 'OFF_PATH' in status:
-            # Automatic Dynamic Re-planning on Deviation / Recovery
+            # Dynamic re-planning on severe deviation — rate-limited to avoid loops
             now = time.time()
-            if not hasattr(self, '_last_replan_time') or (now - self._last_replan_time > 3.0):
+            replan_count = getattr(self, '_replan_count', 0)
+            last_replan  = getattr(self, '_last_replan_time', 0.0)
+            # Only replan if: cooldown elapsed AND under max replans AND mission active
+            if (now - last_replan > 60.0) and (replan_count < 3) and self.mission_active:
                 self._last_replan_time = now
+                self._replan_count = replan_count + 1
                 target = self.current_start_stop if self.mission_state == 'LEG_1_DISPATCH' else self.current_goal_stop
-                self.get_logger().warn(f"Buggy off-path! Auto-recalculating fresh route to '{target}'...")
+                self.get_logger().warn(
+                    f"Buggy off-path (replan {self._replan_count}/3)! "
+                    f"Re-calculating route to '{target}'...")
                 self._publish_status(f"🔄 Re-calculating route to '{target}' from current pose...")
                 self.waiting_for_path = True
                 self.plan_route_pub.publish(String(data=f"CURRENT|{target}"))
@@ -380,8 +406,11 @@ class MissionControllerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MissionControllerNode()
+    from rclpy.executors import MultiThreadedExecutor
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

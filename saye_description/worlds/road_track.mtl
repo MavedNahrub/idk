@@ -1,0 +1,7 @@
+newmtl road_material
+Ka 1.0 1.0 1.0
+Kd 1.0 1.0 1.0
+Ks 0.0 0.0 0.0
+d 1.0
+illum 1
+map_Kd road_texture.png

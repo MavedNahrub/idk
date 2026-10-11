@@ -6,8 +6,8 @@ Panels:
       Expanded:
         - /Livox Mid-360 Live Cloud (/cloud)1
         - /saye Buggy (Live 3D Model)1
-      Splitter Ratio: 0.55
-    Tree Height: 350
+      Splitter Ratio: 0.550000011920929
+    Tree Height: 202
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -22,7 +22,7 @@ Visualization Manager:
       Color: 70; 80; 95
       Enabled: true
       Line Style:
-        Line Width: 0.03
+        Line Width: 0.029999999329447746
         Value: Lines
       Name: Reference Grid
       Normal Cell Count: 0
@@ -34,31 +34,33 @@ Visualization Manager:
       Plane Cell Count: 30
       Reference Frame: <Fixed Frame>
       Value: true
-    - Alpha: 1.0
+    - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 6
         Min Value: -1
         Value: true
       Axis: Z
+      Channel Name: intensity
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
       Color Transformer: AxisColor
-      Decay Time: 0.0
+      Decay Time: 0
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
+      Max Intensity: 4096
       Min Color: 0; 0; 0
+      Min Intensity: 0
       Name: Livox Mid-360 Live Cloud (/cloud)
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 6
-      Size (m): 0.12
+      Size (m): 0.11999999731779099
       Style: Flat Squares
       Topic:
         Depth: 5
         Durability Policy: Volatile
-        Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
         Value: /cloud
@@ -67,33 +69,40 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
+      Name: saye Buggy (Live 3D Model)
+      Namespaces:
+        buggy: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /campus/vehicle_marker
-      Name: saye Buggy (Live 3D Model)
       Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
+      Name: Safety Lookahead Corridor
+      Namespaces:
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
+        Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /campus/safety_corridor
-      Name: Safety Lookahead Corridor
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
+      Name: Detected Threat Clusters
+      Namespaces:
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /campus/safety_threats
-      Name: Detected Threat Clusters
       Value: true
   Enabled: true
   Global Options:
@@ -116,57 +125,75 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 26.0
+      Distance: 26
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
       Focal Point:
-        X: 0.0
-        Y: -1.0
-        Z: 0.0
+        X: 0
+        Y: -1
+        Z: 0
       Focal Shape Fixed Size: true
-      Focal Shape Size: 0.05
+      Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
-      Name: Buggy Follower Livox View
-      Near Clip Distance: 0.1
-      Pitch: 0.55
-      Target Frame: base_link
+      Name: Current View
+      Near Clip Distance: 0.10000000149011612
+      Pitch: 0.550000011920929
+      Target Frame: nav_base_link
       Value: Orbit (rviz_default_plugins)
-      Yaw: 1.5708
+      Yaw: 1.5707999467849731
     Saved:
       - Class: rviz_default_plugins/Orbit
-        Distance: 26.0
+        Distance: 26
+        Enable Stereo Rendering:
+          Stereo Eye Separation: 0.05999999865889549
+          Stereo Focal Distance: 1
+          Swap Stereo Eyes: false
+          Value: false
         Focal Point:
-          X: 0.0
-          Y: -1.0
-          Z: 0.0
+          X: 0
+          Y: -1
+          Z: 0
         Focal Shape Fixed Size: true
-        Focal Shape Size: 0.05
+        Focal Shape Size: 0.05000000074505806
         Invert Z Axis: false
         Name: Buggy Follower Livox View
-        Near Clip Distance: 0.1
-        Pitch: 0.55
-        Target Frame: base_link
+        Near Clip Distance: 0.10000000149011612
+        Pitch: 0.550000011920929
+        Target Frame: nav_base_link
         Value: Orbit (rviz_default_plugins)
-        Yaw: 1.5708
+        Yaw: 1.5707999467849731
       - Class: rviz_default_plugins/Orbit
-        Distance: 45.0
+        Distance: 45
+        Enable Stereo Rendering:
+          Stereo Eye Separation: 0.05999999865889549
+          Stereo Focal Distance: 1
+          Swap Stereo Eyes: false
+          Value: false
         Focal Point:
-          X: 817.0
-          Y: 725.0
-          Z: 1.0
+          X: 817
+          Y: 725
+          Z: 1
         Focal Shape Fixed Size: true
-        Focal Shape Size: 0.05
+        Focal Shape Size: 0.05000000074505806
         Invert Z Axis: false
         Name: World Fixed Livox View
-        Near Clip Distance: 0.1
-        Pitch: 0.65
+        Near Clip Distance: 0.10000000149011612
+        Pitch: 0.6499999761581421
         Target Frame: <Fixed Frame>
         Value: Orbit (rviz_default_plugins)
-        Yaw: 4.71
+        Yaw: 4.710000038146973
 Window Geometry:
   Displays:
     collapsed: false
+  Height: 520
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd00000001000000000000019b000001b2fc0200000002fb000000100044006900730070006c006100790073010000003b00000105000000c700fffffffb0000000a005600690065007700730100000146000000a7000000a000ffffff0000021f000001b200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Height: 520
   Width: 960
   X: 960
-  Y: 0
+  Y: 32

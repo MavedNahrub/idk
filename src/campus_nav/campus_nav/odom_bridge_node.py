@@ -23,7 +23,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 from tf2_msgs.msg import TFMessage
 from tf2_ros import TransformBroadcaster
 
-from campus_nav.coord_bridge import gz_to_nav, nav_to_gz, yaw_from_quaternion, quaternion_from_yaw
+from campus_nav.coord_bridge import (
+    gz_to_nav, nav_to_gz, yaw_from_quaternion, quaternion_from_yaw,
+    yaw_gz_to_nav, yaw_nav_to_gz
+)
 from campus_nav.osm_loader import CampusMap
 import os
 
@@ -78,21 +81,40 @@ class OdomBridgeNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         # Subscribers
-        # Ground truth world odometry from Gazebo bridge (/model/saye/odometry_world)
+        # Ground truth world poses directly from Gazebo Harmonic
+        self.gz_pose_sub = self.create_subscription(
+            TFMessage, '/campus/gazebo_poses', self.gazebo_poses_callback, 10)
+
+        # Fallback local odometry from Gazebo plugin
         self.odom_sub = self.create_subscription(
-            Odometry, '/model/saye/odometry_world', self.odometry_callback, 10)
+            Odometry, '/model/saye/odometry', self.odometry_callback, 10)
 
         self.last_gz_x = None
         self.last_gz_y = None
         self.last_gz_z = 0.60
         self.last_yaw = 0.0
         self.last_recovery_time = 0.0
+        self._got_gz_world_pose = False
 
         self.get_logger().info(
-            f"OdomBridgeNode ready. Tracking '{self.model_name}' via ground-truth /model/saye/odometry.")
+            f"OdomBridgeNode ready. Tracking '{self.model_name}' via ground-truth world poses & odometry.")
+
+    def gazebo_poses_callback(self, msg: TFMessage):
+        """Receive ground-truth Gazebo world pose directly from Gazebo simulation engine."""
+        for i, t in enumerate(msg.transforms):
+            cid = t.child_frame_id.strip('/')
+            # Match by child_frame_id, or if empty string, index 0 is always the root model 'saye'
+            if cid == self.model_name or cid.endswith(self.model_name) or (not cid and i == 0):
+                self._got_gz_world_pose = True
+                tr = t.transform.translation
+                rot = t.transform.rotation
+                self._process_pose(tr.x, tr.y, tr.z, rot)
+                break
 
     def odometry_callback(self, msg: Odometry):
-        """Process ground-truth world odometry from Gazebo."""
+        """Process local odometry from Gazebo (fallback only if world pose not yet received)."""
+        if self._got_gz_world_pose:
+            return
         pos = msg.pose.pose.position
         ori = msg.pose.pose.orientation
         self._process_pose(pos.x, pos.y, pos.z, ori)
@@ -104,21 +126,30 @@ class OdomBridgeNode(Node):
         self.last_gz_z = gz_z
         self.last_yaw = yaw
 
-        # ── 1. Void Recovery Supervisor ─────────────────────────────────────────
-        if gz_z < -0.5:
-            now_sec = time.time()
-            if now_sec - self.last_recovery_time > 2.0:
-                self.last_recovery_time = now_sec
-                self._recover_from_void(gz_x, gz_y)
-                return
+        # ── 1. Void & Off-Road Recovery Supervisor ──────────────────────────────
+        # Catch falling into void (Z < -0.5) or wandering into grass (> 3.0m off-road)
+        nav_x, nav_y = gz_to_nav(gz_x, gz_y)
+        now_sec = time.time()
+        is_in_void = gz_z < -0.5
+        road_dist = self.campus.distance_to_road_segment(nav_x, nav_y) if self.campus else 0.0
+        is_deep_offroad = road_dist > 3.8
+
+
+        if (is_in_void or is_deep_offroad) and (now_sec - self.last_recovery_time > 2.0):
+            self.last_recovery_time = now_sec
+            reason = "fell below road" if is_in_void else f"wandered {road_dist:.1f}m off road"
+            self.get_logger().warn(f"🚨 Buggy {reason}! Catching and respawning onto nearest road lane...")
+            self._recover_from_void(gz_x, gz_y)
+            return
 
         # ── 2. Convert to planner coords ────────────────────────────────────────
-        nav_x, nav_y = gz_to_nav(gz_x, gz_y)
         now = self.get_clock().now().to_msg()
 
-        # Buggy's driving heading in map coordinates: yaw - pi/2 (due to URDF local frame)
-        driving_yaw = yaw - (math.pi / 2.0)
-        qx, qy, qz, qw = quaternion_from_yaw(driving_yaw)
+        # Buggy's physical heading: saye front is -Y in base_link (model_yaw - pi/2)
+        phys_gz = (yaw - math.pi / 2.0 + math.pi) % (2.0 * math.pi) - math.pi
+        nav_yaw = yaw_gz_to_nav(phys_gz)
+
+        qx, qy, qz, qw = quaternion_from_yaw(nav_yaw)
 
         # ── 3. Publish /campus/vehicle_pose ─────────────────────────────────────
         pose_msg = PoseStamped()
@@ -144,22 +175,36 @@ class OdomBridgeNode(Node):
         odom_msg.pose.pose.orientation = orientation_q
         self.odom_pub.publish(odom_msg)
 
-        # ── 4b. Broadcast TF: map -> world & map -> base_link ──────────────────
-        t = TransformStamped()
-        t.header.stamp = now
-        t.header.frame_id = 'map'
-        t.child_frame_id = 'world'
-        t.transform.translation.x = 802.0
-        t.transform.translation.y = 679.7
-        t.transform.translation.z = 0.0
-        t.transform.rotation.x = 0.0
-        t.transform.rotation.y = 0.0
-        t.transform.rotation.z = 0.0
-        t.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(t)
+        # ── 4b. Broadcast TF: map -> odom & map -> world ──────────────────────
+        # IIT Ropar Gazebo world to planner metric coordinate transform:
+        # nav_x = 760.49 - gz_y, nav_y = 718.37 + gz_x (Rotation = +90 deg around Z)
+        t_odom = TransformStamped()
+        t_odom.header.stamp = now
+        t_odom.header.frame_id = 'map'
+        t_odom.child_frame_id = 'odom'
+        t_odom.transform.translation.x = 760.49
+        t_odom.transform.translation.y = 718.37
+        t_odom.transform.translation.z = 0.0
+        t_odom.transform.rotation.x = 0.0
+        t_odom.transform.rotation.y = 0.0
+        t_odom.transform.rotation.z = 0.7071067811865475
+        t_odom.transform.rotation.w = 0.7071067811865476
+        self.tf_broadcaster.sendTransform(t_odom)
 
-        # Removed conflicting map -> base_link TF broadcast
-        # since Gazebo publishes world -> base_footprint -> base_link, and we publish map -> world.
+        # Also broadcast aliases for world and saye/odom
+        t_world = TransformStamped()
+        t_world.header.stamp = now
+        t_world.header.frame_id = 'map'
+        t_world.child_frame_id = 'world'
+        t_world.transform = t_odom.transform
+        self.tf_broadcaster.sendTransform(t_world)
+
+        t_saye_odom = TransformStamped()
+        t_saye_odom.header.stamp = now
+        t_saye_odom.header.frame_id = 'map'
+        t_saye_odom.child_frame_id = 'saye/odom'
+        t_saye_odom.transform = t_odom.transform
+        self.tf_broadcaster.sendTransform(t_saye_odom)
 
         t_nav = TransformStamped()
         t_nav.header.stamp = now
@@ -175,26 +220,34 @@ class OdomBridgeNode(Node):
         self.tf_broadcaster.sendTransform(t_nav)
 
         # ── 5. Publish 3D High-Contrast Vehicle Marker for RViz ────────────────
-        self._publish_vehicle_markers(now)
+        self._publish_vehicle_markers(now, nav_x, nav_y, gz_z, nav_yaw, qx, qy, qz, qw)
 
-    def _publish_vehicle_markers(self, stamp):
-        """Constructs and publishes a 3D high-visibility buggy marker in RViz (attached to base_link)."""
+    def _publish_vehicle_markers(self, stamp, nav_x, nav_y, gz_z, nav_yaw, qx, qy, qz, qw):
+        """Constructs and publishes a 3D high-visibility buggy marker in RViz in Fixed Frame 'map'."""
         ma = MarkerArray()
+
+        # Buggy chassis center is ~0.60m behind the front axle origin along heading
+        cx = nav_x - 0.60 * math.cos(nav_yaw)
+        cy = nav_y - 0.60 * math.sin(nav_yaw)
+        cz = gz_z + 0.40
 
         # 1. Main Chassis (Fluorescent Orange)
         body = Marker()
-        body.header.frame_id = 'base_link'
+        body.header.frame_id = 'map'
         body.header.stamp = stamp
         body.ns = 'buggy'
         body.id = 0
         body.type = Marker.CUBE
         body.action = Marker.ADD
-        body.pose.position.x = 0.0
-        body.pose.position.y = 0.60
-        body.pose.position.z = 0.40
-        body.pose.orientation.w = 1.0
-        body.scale.x = 1.3  # Width along X
-        body.scale.y = 2.4  # Length along Y
+        body.pose.position.x = cx
+        body.pose.position.y = cy
+        body.pose.position.z = cz
+        body.pose.orientation.x = qx
+        body.pose.orientation.y = qy
+        body.pose.orientation.z = qz
+        body.pose.orientation.w = qw
+        body.scale.x = 2.4  # Length along driving heading
+        body.scale.y = 1.3  # Width lateral to driving heading
         body.scale.z = 0.5  # Height
         body.color.r = 1.0
         body.color.g = 0.35
@@ -204,34 +257,39 @@ class OdomBridgeNode(Node):
 
         # 2. Canopy Roof (Clean White)
         roof = Marker()
-        roof.header = body.header
+        roof.header.frame_id = 'map'
+        roof.header.stamp = stamp
         roof.ns = 'buggy'
         roof.id = 1
         roof.type = Marker.CUBE
         roof.action = Marker.ADD
-        roof.pose.position.x = 0.0
-        roof.pose.position.y = 0.60
-        roof.pose.position.z = 1.30
-        roof.pose.orientation.w = 1.0
-        roof.scale.x = 1.2
-        roof.scale.y = 1.7
-        roof.scale.z = 0.08
+        roof.pose.position.x = cx
+        roof.pose.position.y = cy
+        roof.pose.position.z = gz_z + 1.30
+        roof.pose.orientation.x = qx
+        roof.pose.orientation.y = qy
+        roof.pose.orientation.z = qz
+        roof.pose.orientation.w = qw
+        roof.scale.x = 1.7  # Length
+        roof.scale.y = 1.2  # Width
+        roof.scale.z = 0.08 # Thickness
         roof.color.r = 0.95
         roof.color.g = 0.95
         roof.color.b = 0.95
         roof.color.a = 0.95
         ma.markers.append(roof)
 
-        # 3. Heading Arrow (Bright Yellow, points straight forward along -Y through the front bumper)
+        # 3. Heading Arrow (Bright Yellow, points straight forward through front bumper)
         arrow = Marker()
-        arrow.header = body.header
+        arrow.header.frame_id = 'map'
+        arrow.header.stamp = stamp
         arrow.ns = 'buggy'
         arrow.id = 2
         arrow.type = Marker.ARROW
         arrow.action = Marker.ADD
         arrow.points = [
-            Point(x=0.0, y=0.0, z=0.70),
-            Point(x=0.0, y=-2.0, z=0.70)
+            Point(x=nav_x, y=nav_y, z=gz_z + 0.70),
+            Point(x=nav_x + 2.0 * math.cos(nav_yaw), y=nav_y + 2.0 * math.sin(nav_yaw), z=gz_z + 0.70)
         ]
         arrow.scale.x = 0.25 # Shaft diameter
         arrow.scale.y = 0.50 # Head diameter
@@ -244,14 +302,15 @@ class OdomBridgeNode(Node):
 
         # 4. Text Label
         label = Marker()
-        label.header = body.header
+        label.header.frame_id = 'map'
+        label.header.stamp = stamp
         label.ns = 'buggy'
         label.id = 3
         label.type = Marker.TEXT_VIEW_FACING
         label.action = Marker.ADD
-        label.pose.position.x = 0.0
-        label.pose.position.y = 0.0
-        label.pose.position.z = 1.85
+        label.pose.position.x = nav_x
+        label.pose.position.y = nav_y
+        label.pose.position.z = gz_z + 1.85
         label.scale.z = 1.0
         label.text = "saye Buggy"
         label.color.r = 1.0
@@ -283,12 +342,14 @@ class OdomBridgeNode(Node):
             target_nav_x, target_nav_y = gz_to_nav(respawn_gz_x, respawn_gz_y)
 
         # Orient buggy towards connected road neighbor (inwards towards campus)
-        respawn_yaw_gz = 1.5708
+        # CRITICAL: saye front is -Y → model_yaw = physical_heading + π/2
+        respawn_yaw_gz = 1.5708 + math.pi / 2.0  # default + correction
         if nearest_nid and nearest_nid in self.campus.road_graph and self.campus.road_graph[nearest_nid]:
             nbr = next(iter(self.campus.road_graph[nearest_nid]))
             nbr_x, nbr_y = self.campus.xy_nodes[nbr]
             nav_angle = math.atan2(nbr_y - target_nav_y, nbr_x - target_nav_x)
-            respawn_yaw_gz = nav_angle + (math.pi / 2.0)
+            phys_gz = yaw_nav_to_gz(nav_angle)
+            respawn_yaw_gz = (phys_gz + math.pi / 2.0 + math.pi) % (2.0 * math.pi) - math.pi
 
         qz = math.sin(respawn_yaw_gz / 2.0)
         qw = math.cos(respawn_yaw_gz / 2.0)

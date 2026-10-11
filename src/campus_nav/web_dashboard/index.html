@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SAYE Autonomous Buggy | Live Lane Perception &amp; Navigation Dashboard</title>
+  <meta name="description" content="Real-time live monitoring dashboard for autonomous lane perception, dynamic Ackermann turning radius, orientation correction, and route execution.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="dashboard-shell">
+    <!-- Top Header Navigation Bar -->
+    <header class="top-nav" id="topNav">
+      <div class="brand-group">
+        <div class="logo-orb">
+          <div class="orb-inner"></div>
+        </div>
+        <div class="brand-text">
+          <div class="brand-title">SAYE AUTONOMOUS BUGGY</div>
+          <div class="brand-subtitle">IIT ROPAR &bull; LANE PERCEPTION &amp; ACKERMANN TELEMETRY</div>
+        </div>
+      </div>
+
+      <div class="header-center-status">
+        <div class="status-chip active" id="systemStateChip">
+          <span class="pulse-dot"></span>
+          <span id="systemStateText">INITIALIZING</span>
+        </div>
+        <div class="status-chip telemetry-chip">
+          <span class="rate-indicator"></span>
+          <span id="rateText">LIVE 20Hz</span>
+        </div>
+      </div>
+
+      <div class="header-meta">
+        <div class="time-readout" id="clockDisplay">--:--:--</div>
+        <button class="btn-theme-toggle" id="btnThemeToggle" title="Toggle High Contrast Mode" aria-label="Toggle High Contrast">
+          <span class="icon-bulb"></span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Grid Content Area -->
+    <main class="dashboard-grid">
+      <!-- Left Column: Primary Video Feeds & Telemetry Graphs -->
+      <section class="viewport-col">
+        <!-- Live Video Stream Card -->
+        <div class="dash-card video-card" id="videoCard">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="icon-camera"></span>
+              <h2 class="card-title">Live Algorithmic Lane Perception</h2>
+            </div>
+            
+            <!-- Feed Mode Tabs -->
+            <div class="tab-pill-group" role="tablist">
+              <button class="tab-pill active" id="tabLane" data-feed="lane" role="tab" aria-selected="true">
+                HUD Perception
+              </button>
+              <button class="tab-pill" id="tabBirdseye" data-feed="birdseye" role="tab" aria-selected="false">
+                Bird's-Eye (BEV)
+              </button>
+              <button class="tab-pill" id="tabSplit" data-feed="split" role="tab" aria-selected="false">
+                Split Dual-View
+              </button>
+              <button class="tab-pill" id="tabRaw" data-feed="raw" role="tab" aria-selected="false">
+                Raw Camera
+              </button>
+            </div>
+
+            <div class="card-actions">
+              <button class="btn-icon" id="btnSnapshot" title="Save Frame Snapshot">
+                <span class="icon-snapshot"></span>
+              </button>
+              <button class="btn-icon" id="btnFullscreen" title="Toggle Fullscreen">
+                <span class="icon-expand"></span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Video Stream Container -->
+          <div class="stream-stage" id="streamStage">
+            <!-- Single Stream Mode -->
+            <div class="stream-wrapper" id="singleStreamWrapper">
+              <img id="primaryStreamImg" src="/stream/lane" alt="Live Lane Perception Feed" crossorigin="anonymous">
+              <div class="stream-overlay-hud" id="streamOverlayHud">
+                <div class="hud-tag top-left" id="hudModeTag">
+                  <span class="hud-dot"></span>
+                  <span id="hudModeLabel">LANE LOCK: KEEP-LEFT</span>
+                </div>
+                <div class="hud-tag top-right" id="hudTelemetryTag">
+                  <span id="hudSpeedReadout">2.40 m/s</span> &bull; <span id="hudSteerReadout">0.0°</span>
+                </div>
+                <div class="hud-tag bottom-left" id="hudRadiusTag">
+                  <span>R_dyn: </span><strong id="hudRadiusValue">&infin;</strong>
+                </div>
+                <div class="hud-tag bottom-right" id="hudRecoveryTag" style="display:none;">
+                  <span class="alert-pulse">REVERSING &bull; REALIGNING</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Dual Split Stream Mode (hidden by default) -->
+            <div class="split-stream-wrapper" id="splitStreamWrapper" style="display:none;">
+              <div class="split-pane">
+                <div class="pane-label">Front RealSense + Lane HUD</div>
+                <img id="splitStreamLeft" src="/stream/lane" alt="Front Camera HUD" crossorigin="anonymous">
+              </div>
+              <div class="split-pane">
+                <div class="pane-label">Bird's-Eye View (BEV) Radar</div>
+                <img id="splitStreamRight" src="/stream/birdseye" alt="Bird's-Eye View" crossorigin="anonymous">
+              </div>
+            </div>
+
+            <!-- Stream Fallback / Loading Banner -->
+            <div class="stream-loader" id="streamLoader" style="display:none;">
+              <div class="spinner"></div>
+              <span>Connecting to ROS video bridge...</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Real-Time Telemetry Timeline Waveform Chart Card -->
+        <div class="dash-card chart-card" id="chartCard">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="icon-chart"></span>
+              <h2 class="card-title">Real-Time Telemetry Dynamics (30s Rolling Window)</h2>
+            </div>
+            <div class="chart-legend">
+              <span class="legend-item"><span class="legend-dot color-speed"></span> Speed (m/s)</span>
+              <span class="legend-item"><span class="legend-dot color-steer"></span> Steering (deg)</span>
+              <span class="legend-item"><span class="legend-dot color-orient"></span> Heading Err (deg)</span>
+            </div>
+          </div>
+          <div class="canvas-container">
+            <canvas id="telemetryCanvas" width="900" height="180"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Telemetry Gauges, 4-Wheel Radar & Mission Dispatcher -->
+      <aside class="telemetry-col">
+        <!-- Hero Gauge Cluster -->
+        <div class="dash-card gauge-card" id="gaugeCard">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="icon-gauge"></span>
+              <h2 class="card-title">Ackermann Kinematics</h2>
+            </div>
+            <span class="badge-speed" id="speedBadge">2x SPEED ACTIVE</span>
+          </div>
+
+          <div class="gauges-container">
+            <!-- Speed Dial -->
+            <div class="gauge-item">
+              <div class="svg-gauge-box">
+                <svg viewBox="0 0 120 120" class="gauge-svg">
+                  <circle class="gauge-track" cx="60" cy="60" r="48" fill="none" stroke-width="8"></circle>
+                  <circle class="gauge-bar speed-bar" id="speedBar" cx="60" cy="60" r="48" fill="none" stroke-width="8" stroke-dasharray="301.6" stroke-dashoffset="301.6"></circle>
+                </svg>
+                <div class="gauge-readout">
+                  <span class="gauge-num" id="valSpeed">0.00</span>
+                  <span class="gauge-unit">m/s</span>
+                  <span class="gauge-sub" id="valSpeedKmh">0.0 km/h</span>
+                </div>
+              </div>
+              <div class="gauge-label">Vehicle Velocity</div>
+            </div>
+
+            <!-- Steering Angle Arc -->
+            <div class="gauge-item">
+              <div class="svg-gauge-box">
+                <svg viewBox="0 0 120 120" class="gauge-svg">
+                  <circle class="gauge-track" cx="60" cy="60" r="48" fill="none" stroke-width="8"></circle>
+                  <circle class="gauge-bar steer-bar" id="steerBar" cx="60" cy="60" r="48" fill="none" stroke-width="8" stroke-dasharray="301.6" stroke-dashoffset="150.8"></circle>
+                </svg>
+                <div class="gauge-readout">
+                  <span class="gauge-num" id="valSteer">0.0°</span>
+                  <span class="gauge-unit">deg</span>
+                  <span class="gauge-sub" id="valSteerDir">CENTER</span>
+                </div>
+              </div>
+              <div class="gauge-label">Steering Angle (max 28.6°)</div>
+            </div>
+          </div>
+
+          <!-- Relative Orientation Error Bipolar Indicator -->
+          <div class="orientation-meter-box">
+            <div class="meter-header">
+              <span class="meter-title">Lane Alignment Heading Error (&Delta;&psi;)</span>
+              <span class="meter-val" id="valOrient">0.0°</span>
+            </div>
+            <div class="bipolar-track">
+              <div class="bipolar-center-line"></div>
+              <div class="bipolar-fill" id="orientFill"></div>
+              <div class="bipolar-needle" id="orientNeedle"></div>
+              <div class="zone-warning-left" title="Critical Reverse Trigger (55°)"></div>
+              <div class="zone-warning-right" title="Critical Reverse Trigger (55°)"></div>
+            </div>
+            <div class="meter-scale-labels">
+              <span>-90° (Left)</span>
+              <span>-45°</span>
+              <span>0° (Aligned)</span>
+              <span>+45°</span>
+              <span>+90° (Right)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4-Wheel Clearance & Edge Guard Radar -->
+        <div class="dash-card radar-card" id="radarCard">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="icon-shield"></span>
+              <h2 class="card-title">4-Wheel Edge Guard Clearance</h2>
+            </div>
+            <span class="status-indicator-badge safe" id="edgeSafetyBadge">SAFE CLEARANCE</span>
+          </div>
+
+          <div class="chassis-diagram-container">
+            <div class="chassis-box">
+              <!-- Wheel indicators -->
+              <div class="wheel-pod fl" id="podFL">
+                <span class="pod-label">FL</span>
+                <span class="pod-val" id="valFL">2.4m</span>
+              </div>
+              <div class="wheel-pod fr" id="podFR">
+                <span class="pod-label">FR</span>
+                <span class="pod-val" id="valFR">2.4m</span>
+              </div>
+              
+              <!-- Chassis Outline -->
+              <div class="chassis-silhouette">
+                <div class="chassis-front-arrow"></div>
+                <div class="chassis-core">
+                  <span>SAYE</span>
+                </div>
+              </div>
+
+              <div class="wheel-pod rl" id="podRL">
+                <span class="pod-label">RL</span>
+                <span class="pod-val" id="valRL">2.4m</span>
+              </div>
+              <div class="wheel-pod rr" id="podRR">
+                <span class="pod-label">RR</span>
+                <span class="pod-val" id="valRR">2.4m</span>
+              </div>
+            </div>
+
+            <div class="clearance-summary">
+              <div class="summary-stat">
+                <span class="stat-label">Critical Wheel</span>
+                <strong class="stat-val" id="criticalWheelName">RR</strong>
+              </div>
+              <div class="summary-stat">
+                <span class="stat-label">Curb Clearance</span>
+                <strong class="stat-val safe" id="criticalWheelClearance">&gt; 2.20 m</strong>
+              </div>
+              <div class="summary-stat">
+                <span class="stat-label">Road Half-Width</span>
+                <strong class="stat-val">3.00 m</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Mission Progress & Navigation Card -->
+        <div class="dash-card nav-card" id="navCard">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="icon-nav"></span>
+              <h2 class="card-title">Campus Route Navigation</h2>
+            </div>
+            <span class="gate-readout" id="gateReadout">Gate 0 / 0 (0%)</span>
+          </div>
+
+          <!-- Progress Bar -->
+          <div class="progress-track">
+            <div class="progress-fill" id="routeProgressFill" style="width: 0%;"></div>
+          </div>
+
+          <!-- Active Instruction Banner -->
+          <div class="checkpoint-banner" id="checkpointBanner">
+            <div class="turn-glyph" id="turnGlyph">&bull;</div>
+            <div class="checkpoint-content">
+              <div class="checkpoint-title" id="checkpointTitle">Awaiting Mission Request...</div>
+              <div class="checkpoint-details">
+                <span id="checkpointDist">-- m</span> &bull; <span id="checkpointEta">ETA: -- s</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mission Dispatcher Panel -->
+          <div class="mission-dispatch-box">
+            <div class="dispatch-title">Autonomous Mission Dispatcher</div>
+            <div class="preset-pills">
+              <button class="btn-preset" data-start="Ravi Back" data-goal="Chemistry Block">Ravi &rarr; Chem</button>
+              <button class="btn-preset" data-start="SAB C" data-goal="Chemistry Block">SAB C &rarr; Chem</button>
+              <button class="btn-preset" data-start="Satluj Front" data-goal="Main Gate">Satluj &rarr; Gate</button>
+            </div>
+
+            <div class="dispatch-inputs">
+              <div class="input-col">
+                <label for="selectStartStop">Departure Stop</label>
+                <select id="selectStartStop" class="dash-select">
+                  <option value="Ravi Back">Ravi Back</option>
+                  <option value="SAB C">SAB C</option>
+                  <option value="Satluj Front">Satluj Front</option>
+                  <option value="Satluj Back">Satluj Back</option>
+                  <option value="Beas Front">Beas Front</option>
+                  <option value="Chenab Front">Chenab Front</option>
+                  <option value="Main Gate">Main Gate</option>
+                  <option value="Library">Library</option>
+                </select>
+              </div>
+
+              <div class="input-col">
+                <label for="selectGoalStop">Destination Stop</label>
+                <select id="selectGoalStop" class="dash-select">
+                  <option value="Chemistry Block" selected>Chemistry Block</option>
+                  <option value="Ravi Back">Ravi Back</option>
+                  <option value="SAB C">SAB C</option>
+                  <option value="Satluj Front">Satluj Front</option>
+                  <option value="Main Gate">Main Gate</option>
+                  <option value="Library">Library</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="dispatch-actions">
+              <button class="btn-launch-mission" id="btnLaunchMission">
+                <span class="icon-rocket"></span>
+                <span>Dispatch Autonomous Mission</span>
+              </button>
+              <button class="btn-estop" id="btnEstop" title="Emergency Stop">
+                <span>ESTOP</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- Footer Status Banner -->
+    <footer class="dash-footer">
+      <div class="footer-left">
+        <span>SAYE Dynamic Ackermann Controller &bull; ROS 2 Jazzy &bull; Gazebo Harmonic World</span>
+      </div>
+      <div class="footer-right">
+        <span id="footerConnection">Connected to Telemetry Bridge (ws://localhost:8080)</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

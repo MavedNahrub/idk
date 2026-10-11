@@ -80,9 +80,14 @@ def generate_launch_description():
             '-topic', '/robot_description',  # Uses the topic published by robot_state_publisher
             '-name', 'saye',
             '-allow_renaming', 'true',
-            '-z', '0.35'
+            '-x', '26.70',
+            '-y', '-56.88',
+            '-z', '0.40',
+            '-Y', '1.5708'
         ]
+
     )
+
     
     return LaunchDescription([
         SetEnvironmentVariable(name='IGN_GAZEBO_RESOURCE_PATH', value=saye_share_parent),

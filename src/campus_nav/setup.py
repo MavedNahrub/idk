@@ -16,6 +16,7 @@ setup(
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'data'), glob('data/*.osm')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'web_dashboard'), glob('web_dashboard/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -38,6 +39,8 @@ setup(
             'wasd_teleop              = campus_nav.wasd_teleop:main',
             'test_obstacle_spawner    = campus_nav.test_obstacle_spawner:main',
             'arrange_windows          = campus_nav.arrange_windows:arrange',
+            'route_monitor            = campus_nav.route_monitor:main',
+            'dashboard_node           = campus_nav.dashboard_node:main',
         ],
     },
 )
