@@ -2,5 +2,10 @@
 /install/
 /log/
 /.vscode/
-/src/campus_nav/campus_nav/__pycache__
 /others/
+**/__pycache__/
+*.py[cod]
+frames_*
+*.jpg
+*.png
+*.zip

@@ -181,10 +181,13 @@ class CampusMap:
             return 760.49 - gy, gx + 718.37
 
         mesh_nav_segments = []
+        current_mtl = ''
         try:
             with open(obj_path, 'r') as f:
                 for line in f:
-                    if line.startswith('f '):
+                    if line.startswith('usemtl '):
+                        current_mtl = line.strip().split()[1]
+                    elif line.startswith('f ') and current_mtl == 'roads_service':
                         parts = line.strip().split()[1:]
                         if len(parts) == 4:
                             vi = [int(p.split('/')[0]) - 1 for p in parts]

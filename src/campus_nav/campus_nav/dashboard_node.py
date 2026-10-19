@@ -242,14 +242,14 @@ class DashboardNode(Node):
                             pass
                     elif part.startswith('Edge:'):
                         try:
-                            # Edge:fl:0.53m
+                            # Edge:fl:0.85m
                             tokens = part.split(':')
                             if len(tokens) >= 3:
                                 w_name = tokens[1]
-                                w_dist = float(tokens[2].replace('m', ''))
+                                w_clearance = float(tokens[2].replace('m', ''))
                                 self.telemetry['edge_wheel'] = w_name
-                                self.telemetry['edge_dist'] = w_dist
-                                self.telemetry['edge_clearance'] = max(0.1, 3.0 - w_dist)
+                                self.telemetry['edge_clearance'] = w_clearance
+                                self.telemetry['edge_dist'] = max(0.0, 3.0 - w_clearance)
                         except Exception:
                             pass
 

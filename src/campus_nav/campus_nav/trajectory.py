@@ -7,10 +7,46 @@ with dynamic off-tracking outward clearance compensation and curvature preview s
 import math
 
 
+def _perpendicular_distance(pt, line_start, line_end):
+    dx = line_end[0] - line_start[0]
+    dy = line_end[1] - line_start[1]
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq < 1e-8:
+        return math.hypot(pt[0] - line_start[0], pt[1] - line_start[1])
+    t = max(0.0, min(1.0, ((pt[0] - line_start[0]) * dx + (pt[1] - line_start[1]) * dy) / seg_len_sq))
+    proj_x = line_start[0] + t * dx
+    proj_y = line_start[1] + t * dy
+    return math.hypot(pt[0] - proj_x, pt[1] - proj_y)
+
+
+def _ramer_douglas_peucker(pts, epsilon=0.45):
+    """
+    Simplify polyline waypoints using the Ramer-Douglas-Peucker algorithm.
+    Eliminates dense intermediate micro-nodes (<3m) and GPS quantization noise
+    while preserving true road geometry and intersection centerlines.
+    """
+    if len(pts) < 3:
+        return list(pts)
+    dmax = 0.0
+    index = 0
+    for i in range(1, len(pts) - 1):
+        d = _perpendicular_distance(pts[i], pts[0], pts[-1])
+        if d > dmax:
+            index = i
+            dmax = d
+    if dmax > epsilon:
+        rec1 = _ramer_douglas_peucker(pts[:index + 1], epsilon)
+        rec2 = _ramer_douglas_peucker(pts[index:], epsilon)
+        return rec1[:-1] + rec2
+    else:
+        return [pts[0], pts[-1]]
+
+
 def calculate_dynamic_turning_radius(theta, d_in, d_out, L_wb=2.124):
     """
     Dynamically calculate kinematically feasible turning radius and tangent distance.
     Adapts according to turn deflection angle theta and approach/departure segment lengths.
+    Enforces strict tangent bounds so corner transitions never overshoot road segments.
 
     Args:
         theta: corner deflection angle (radians)
@@ -43,7 +79,7 @@ def calculate_dynamic_turning_radius(theta, d_in, d_out, L_wb=2.124):
     R_kinematic_min = 3.85
 
     # Available tangent distance from segment geometry
-    max_T = min(d_in, d_out) * 0.46
+    max_T = min(d_in, d_out) * 0.44
     T_req = R_target * tan_half
 
     if T_req <= max_T:
@@ -56,8 +92,9 @@ def calculate_dynamic_turning_radius(theta, d_in, d_out, L_wb=2.124):
             R = R_avail
             T = max_T
         else:
-            R = R_kinematic_min
-            T = R * tan_half
+            # Strictly enforce segment tangent bounds so T never exceeds the road segment
+            T = min(min(d_in, d_out) * 0.46, R_kinematic_min * tan_half)
+            R = max(2.5, T / max(tan_half, 1e-4))
 
     return R, T
 
@@ -95,20 +132,13 @@ def generate_smooth_trajectory(waypoints, step_size=0.35, corner_radius=4.5,
     if len(raw_pts) < 2:
         return []
 
-    # 2. Prune intermediate collinear waypoints along straight roads
-    # This prevents dense collinear nodes (e.g. 3m spacing) from artificially truncating
-    # the available straight approach distance for corner arc generation.
-    pts = [raw_pts[0]]
-    for i in range(1, len(raw_pts) - 1):
-        p_prev = pts[-1]
-        p_curr = raw_pts[i]
-        p_next = raw_pts[i + 1]
-        a1 = math.atan2(p_curr[1] - p_prev[1], p_curr[0] - p_prev[0])
-        a2 = math.atan2(p_next[1] - p_curr[1], p_next[0] - p_curr[0])
-        diff = abs((a2 - a1 + math.pi) % (2.0 * math.pi) - math.pi)
-        if diff > math.radians(5.0):  # Heading change > 5° is a genuine corner
-            pts.append(p_curr)
-    pts.append(raw_pts[-1])
+    # 2. Prune redundant collinear micro-nodes using Ramer-Douglas-Peucker (epsilon=0.45m)
+    # This prevents dense polyline nodes (<3m spacing) from artificially truncating
+    # the available straight approach distance for corner arc generation while preserving
+    # true surveyed road centerlines.
+    pts = _ramer_douglas_peucker(raw_pts, epsilon=0.45)
+    if len(pts) < 2:
+        pts = raw_pts
 
     # 3. Build smooth path using dynamic circular arcs tangent to incoming and outgoing roads
     refined = []
@@ -174,7 +204,26 @@ def generate_smooth_trajectory(waypoints, step_size=0.35, corner_radius=4.5,
 
         # Dynamic corner speed scaled by turn severity
         turn_severity = min(1.0, theta / (math.pi / 2.0))
-        spd = max(0.90, v_max * (1.0 - 0.50 * turn_severity))
+        if theta > 1.20:
+            # Acute slant turn: slow down to 0.65 - 0.80 m/s for safe curb clearance
+            spd = max(0.65, 0.95 * (1.0 - 0.35 * turn_severity))
+        elif theta > 0.35:
+            spd = max(0.85, v_max * (1.0 - 0.58 * turn_severity))
+        else:
+            spd = max(0.95, v_max * (1.0 - 0.40 * turn_severity))
+
+        # Ackermann off-tracking outward compensation:
+        # Shift the arc outward towards the center of the intersection so rear inside wheels
+        # maintain > 1.2m of clean asphalt clearance from the inside curb, while preserving
+        # > 1.4m of asphalt margin for the front outside wheels on standard 3.6m campus roads.
+        if theta > 1.20:
+            # Acute / sharp slant turn: expand outward shift up to 0.75m
+            delta_outward = min(0.75, 0.45 + 0.30 * ((theta - 1.20) / 0.80))
+        elif theta > 0.35:
+            # Moderate turn (30° - 70°): scale smoothly from 0.20m to 0.45m
+            delta_outward = 0.20 + 0.25 * ((theta - 0.35) / 0.85)
+        else:
+            delta_outward = 0.0
 
         # Add approach tangent point
         refined.append(pc)
@@ -182,8 +231,14 @@ def generate_smooth_trajectory(waypoints, step_size=0.35, corner_radius=4.5,
         point_spd.append(spd)
 
         for s in range(1, num_steps):
-            a = ang_start + sweep * (s / num_steps)
-            refined.append((center[0] + R * math.cos(a), center[1] + R * math.sin(a)))
+            frac = s / num_steps
+            a = ang_start + sweep * frac
+            # Late-apex profile (exponent 1.22): biases peak outward displacement slightly past
+            # mid-corner (frac ~ 0.56), keeping the vehicle deeper in the intersection throat
+            # before the rear axle sweeps through the apex.
+            profile = math.sin(math.pi * (frac ** 1.22))
+            R_eff = R + delta_outward * profile
+            refined.append((center[0] + R_eff * math.cos(a), center[1] + R_eff * math.sin(a)))
             point_curv.append(curv)
             point_spd.append(spd)
 

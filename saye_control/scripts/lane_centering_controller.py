@@ -62,6 +62,7 @@ class LaneCenteringController(Node):
         self.declare_parameter('recovery_speed', 0.55)        # Speed when recovering from off-track (m/s)
         self.declare_parameter('max_steering', 0.55)          # Maximum Ackermann steering angle (radians)
         self.declare_parameter('enable_control', True)        # Enable active vehicle steering
+        self.declare_parameter('target_edge_distance', 0.50)  # Desired minimum clearance from road edges (m)
 
         self.camera_topic = self.get_parameter('camera_topic').value
         self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
@@ -71,6 +72,7 @@ class LaneCenteringController(Node):
         self.recovery_speed = float(self.get_parameter('recovery_speed').value)
         self.max_steering = float(self.get_parameter('max_steering').value)
         self.enable_control = bool(self.get_parameter('enable_control').value)
+        self.target_edge_dist = float(self.get_parameter('target_edge_distance').value)
 
         # Vehicle physical geometry (Saye model)
         self.wheelbase = 2.124       # Axle separation (m)
@@ -79,9 +81,9 @@ class LaneCenteringController(Node):
         self.fy = 343.159            # Focal length Y (px)
         self.cx = 319.5              # Optical center X (px)
         self.cy = 179.5              # Optical center Y (px)
-        self.road_half_width = 3.5   # Full road width = 7.0m -> half-width = 3.5m
-        self.lane_offset = 1.5       # Drive 1.5m left of road center (left lane, Indian traffic rules)
-        self.lane_width = 3.0        # Single lane width ~3m
+        self.road_half_width = 1.85  # Physical IIT Ropar road half-width = 1.85m (3.7m total)
+        self.lane_offset = 0.45      # Drive 0.45m left of road center (left lane, Indian traffic rules)
+        self.lane_width = 1.85       # Single lane width ~1.85m
 
         # Subscriptions & Publications
         self.image_sub = self.create_subscription(
@@ -93,8 +95,9 @@ class LaneCenteringController(Node):
             Bool, '/safety/emergency_stop', self.safety_callback, 10
         )
 
-        # Advisory lane correction output for path follower integration
+        # Advisory lane correction & edge distance output for path follower integration
         self.lane_correction_pub = self.create_publisher(Float32, '/campus/lane_correction', 10)
+        self.edge_dist_pub = self.create_publisher(Float32, '/campus/visual_edge_dist', 10)
 
         # Detect whether path planning is active (path follower is running)
         self.path_planning_active = False
@@ -228,9 +231,9 @@ class LaneCenteringController(Node):
         # STRICT GREEN GRASS DETECTION
         # -------------------------------------------------------------
         # Road boundaries are defined by where the green grass starts.
-        # Use HSV for shadow invariance. Green hue is ~35 to 85.
-        lower_green = np.array([30, 20, 20])
-        upper_green = np.array([90, 255, 255])
+        # Use HSV for shadow invariance. Green hue is ~35 to 75, Saturation >= 45 (eliminates grey asphalt).
+        lower_green = np.array([35, 45, 40])
+        upper_green = np.array([75, 255, 255])
         mask_grass_roi = cv2.inRange(roi_hsv, lower_green, upper_green)
 
         # Clean up the grass mask
@@ -484,8 +487,8 @@ class LaneCenteringController(Node):
             # Prevents the buggy from cutting too close to the inner corner on turns
             # kappa > 0 (Right turn) -> Shift target Left (-X)
             # kappa < 0 (Left turn)  -> Shift target Right (+X)
-            # Increased widening factor significantly to take safer, wider turns
-            curve_shift = -12.5 * kappa
+            # Clamped so target vector stays safely within physical road surface (half-width 1.85m)
+            curve_shift = max(-0.45, min(0.45, -1.8 * kappa))
             X_target += curve_shift
 
             # Approach angle eta to the imaginary vector target:
@@ -534,22 +537,46 @@ class LaneCenteringController(Node):
             current_speed = self.turn_speed
 
         # -------------------------------------------------------------
-        # 6. Symmetric Soft Boundary Safety Barrier & Corner Buffer
+        # 6. Directional Active Road Edge Buffer & Repulsion
         # -------------------------------------------------------------
-        # Increase safety buffer dynamically during sharp turns to avoid clipping the inside corner
-        dynamic_buffer = 1.7
-        # If curvature (kappa) was computed, use it to expand the buffer
-        try:
-            if abs(kappa) > 0.01:
-                dynamic_buffer = 1.7 + 1.4 * min(1.0, abs(kappa) / 0.05)
-        except NameError:
-            pass # kappa not defined if < 3 points
+        # Calculate physical clearance from wheels (half-track = 0.389m) to grass edges
+        all_left_curbs = [abs(x) for x, z in curb_detections if x < 0]
+        all_right_curbs = [x for x, z in curb_detections if x > 0]
+        # Also include near-field detections from all rows
+        for Z in ground_distances:
+            if Z <= 5.0:
+                v = int(self.cy + (self.camera_height * self.fy) / Z)
+                if roi_top <= v < roi_bottom:
+                    row_idx = v - roi_top
+                    row_y = np.where(mask_yellow_roi[row_idx, :] > 0)[0]
+                    if len(row_y) >= 3:
+                        left_pts = row_y[row_y < w // 2]
+                        right_pts = row_y[row_y >= w // 2]
+                        if len(left_pts) >= 2:
+                            u_in = float(np.max(left_pts))
+                            x_m = float((u_in - self.cx) * Z / self.fx)
+                            all_left_curbs.append(abs(x_m))
+                        if len(right_pts) >= 2:
+                            u_in = float(np.min(right_pts))
+                            x_m = float((u_in - self.cx) * Z / self.fx)
+                            all_right_curbs.append(x_m)
 
-        if min_curb_dist < dynamic_buffer:
-            urgency = (dynamic_buffer - min_curb_dist) / dynamic_buffer
-            repulse_dir = +1.0 if dominant_curb == 'right' else -1.0
-            curb_repulsion = repulse_dir * 1.5 * (urgency ** 1.5) # Massive repulsion away from grass
-            steering_angle += curb_repulsion
+        left_edge_clearance = (min(all_left_curbs) - 0.514) if all_left_curbs else 999.0
+        right_edge_clearance = (min(all_right_curbs) - 0.514) if all_right_curbs else 999.0
+        min_edge_clearance = min(left_edge_clearance, right_edge_clearance)
+
+        curb_repulsion = 0.0
+        # If approaching left curb (< target_edge_dist), steer RIGHT (negative delta) away from left edge
+        if left_edge_clearance < self.target_edge_dist:
+            urgency_left = (self.target_edge_dist - left_edge_clearance) / max(0.1, self.target_edge_dist)
+            curb_repulsion -= 0.40 * (urgency_left ** 1.2)
+
+        # If approaching right curb (< target_edge_dist), steer LEFT (positive delta) away from right edge
+        if right_edge_clearance < self.target_edge_dist:
+            urgency_right = (self.target_edge_dist - right_edge_clearance) / max(0.1, self.target_edge_dist)
+            curb_repulsion += 0.40 * (urgency_right ** 1.2)
+
+        steering_angle += curb_repulsion
 
         # -------------------------------------------------------------
         # 7. Low-Pass Smoothing & Output Command Conversion
@@ -559,12 +586,20 @@ class LaneCenteringController(Node):
         self.smoothed_steering = max(-self.max_steering, min(self.max_steering, self.smoothed_steering))
 
         # Convert Ackermann steering angle delta to Gazebo yaw rate omega:
-        # Gazebo plugin calculates tan(delta) = (omega * L) / v ==> omega = (v * tan(delta)) / L
         omega_cmd = (current_speed * math.tan(self.smoothed_steering)) / self.wheelbase
 
-        # ── Always publish advisory lane correction for path follower ──────────
+        # ── Publish visual edge distance ───────────────────────────────────────
+        if min_edge_clearance < 900.0:
+            ed_msg = Float32()
+            ed_msg.data = float(max(0.0, min_edge_clearance))
+            self.edge_dist_pub.publish(ed_msg)
+
+        # ── Always publish advisory lane/edge correction for path follower ─────
         correction_msg = Float32()
-        correction_msg.data = float(self.smoothed_steering)  # lateral correction in radians
+        if self.path_planning_active:
+            correction_msg.data = float(curb_repulsion)
+        else:
+            correction_msg.data = float(self.smoothed_steering)
         self.lane_correction_pub.publish(correction_msg)
 
         # ── Direct control mode (standalone only, NEVER when path planning is active)
@@ -580,10 +615,12 @@ class LaneCenteringController(Node):
         white_detected = len(white_line_detections) if 'white_line_detections' in dir() else 0
         mode_label = "PATH-ADVISORY" if self.path_planning_active else active_lane.upper()
         status_text = f"KEEP-LEFT | {mode_label}"
+        if min_edge_clearance < 900.0:
+            status_text += f" | EDGE: {min_edge_clearance:.2f}m"
         if white_detected > 0:
             status_text += f" | WHITE LINE: {white_detected}pts"
         if abs(curb_repulsion) > 0.02:
-            status_text += " | BUFFER"
+            status_text += " | BUFFER GUARD ACTIVE"
         self.publish_debug_overlay(bgr, mask_white, mask_yellow, display_pts, target_vec_disp, self.smoothed_steering, current_speed, status=status_text)
 
     def publish_cmd_vel(self, linear_x: float, angular_z: float):

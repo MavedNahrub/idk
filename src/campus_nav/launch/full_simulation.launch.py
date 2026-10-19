@@ -247,6 +247,8 @@ def generate_launch_description():
             'min_speed': 0.80,
             'corner_lookahead': 2.10,
             'lookahead': 3.00,
+            'road_half_width': 1.85,
+            'safe_edge_distance': 0.50,
             'use_sim_time': True
         }]
     )
@@ -340,6 +342,8 @@ def generate_launch_description():
             executable='lane_centering_controller.py',
             name='lane_centering_controller',
             output='screen',
+            respawn=True,
+            respawn_delay=1.0,
             parameters=[{
                 'camera_topic': '/real_sense/image_raw',
                 'cmd_vel_topic': '/campus/cmd_vel_lane',
